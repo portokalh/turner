@@ -24,3 +24,7 @@ Tuning tips
 Slight streaks → raise --lambda_grad (e.g., 1e-3).
 Over-smoothing → lower --lambda_grad (e.g., 2e-4).
 If SNR is too high/clean (since noise_rel=0), add a touch of noise (e.g., --noise_rel 0.01) to test robustness.
+
+
+python 5_residuals_plus.py   --npz /Users/alex/AlexBadea_MyCodes/ute3d/ute3d_N64_S3300_phys.npz   --complex_npz recon_complex.npz   --osf 2.0 --prefix res_phys_complex
+
