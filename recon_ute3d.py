@@ -121,10 +121,10 @@ def _fnufft_type2(xj, yj, zj, fk, isign=+1, eps=1e-9):
 
 # ---------------- Small helpers (NumPy) ----------------
 def fft3c(x):
-    return np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(x)))
+    return np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(x), norm='ortho'))
 
 def ifft3c(X):
-    return np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(X)))
+    return np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(X), norm='ortho'))
 
 def center_pad_to(x, shape):
     out = np.zeros(shape, dtype=x.dtype)
@@ -234,23 +234,34 @@ def cg_tikhonov_torch(A, AH, y, lam_l2=0.0, lam_grad=0.0, N=64, max_iter=15, ver
 # ---------------- FINUFFT operators (CPU) ----------------
 def make_ops_finufft(N, osf, ktraj, dcf, eps=1e-9):
     if not _HAS_FINUFFT:
-        raise RuntimeError("finufft not installed (pip install finufft)")
+        raise RuntimeError("finufft not installed.")
     N_os = int(round(osf * N))
     ms = mt = mu = N_os
+
     xj, yj, zj = ktraj_to_radians(ktraj)
+    xj = np.ascontiguousarray(xj, dtype=np.float64)
+    yj = np.ascontiguousarray(yj, dtype=np.float64)
+    zj = np.ascontiguousarray(zj, dtype=np.float64)
+
     w = np.sqrt(np.maximum(dcf.astype(np.float64), 0.0))
+
     def A(x):
+        # image -> FFT(ortho) -> NU eval (type-2, +1)
         Xos = fft3c(center_pad_to(x, (N_os, N_os, N_os))).astype(np.complex128, copy=False)
-        fk = np.ascontiguousarray(Xos)                 # 3D, C-contiguous, complex128
-        y  = _fnufft_type2(xj, yj, zj, fk, isign=+1, eps=eps)
+        fk  = np.ascontiguousarray(Xos)                 # no manual scaling
+        y   = _fnufft_type2(xj, yj, zj, fk, isign=+1, eps=eps)
         return (w * y).astype(np.complex128)
 
     def AH(y):
+        # NU adjoint (type-1, -1) -> IFFT(ortho) -> crop
         grid = _fnufft_type1(xj, yj, zj, (w * y).astype(np.complex128),
-                             ms, mt, mu, isign=+1, eps=eps)
+                             ms, mt, mu, isign=-1, eps=eps)
         xos = ifft3c(grid.reshape(ms, mt, mu))
-        return center_crop(xos, (N,N,N)).astype(np.complex128)
+        return center_crop(xos, (N, N, N)).astype(np.complex128)
+
     return A, AH
+
+
 
 # ---------------- Torch CIC operators (GPU/CPU) ----------------
 def make_ops_torch_cic(N, osf, ktraj, dcf, device):
@@ -364,19 +375,20 @@ def main():
         if not _HAS_FINUFFT:
             raise RuntimeError("FINUFFT not installed (pip install finufft).")
         if args.mode == "adjoint":
-            N_os = int(round(args.osf * N))
-            ms = mt = mu = N_os
+            # preview adjoint (finufft)
+            N_os = int(round(args.osf * N)); ms = mt = mu = N_os
             xj, yj, zj = ktraj_to_radians(ktraj)
-            #cj = (kdata.astype(np.complex128) * dcf.astype(np.float64))
-            #grid = _fnufft_type1(xj, yj, zj, cj, ms, mt, mu, isign=+1, eps=args.eps)
-            
-            
-            cj = np.ascontiguousarray((kdata.astype(np.complex128) * dcf.astype(np.float64)))
-            grid = _fnufft_type1(xj, yj, zj, cj, ms, mt, mu, isign=+1, eps=args.eps)
+            xj = np.ascontiguousarray(xj, dtype=np.float64)
+            yj = np.ascontiguousarray(yj, dtype=np.float64)
+            zj = np.ascontiguousarray(zj, dtype=np.float64)
+            w  = np.sqrt(np.maximum(dcf.astype(np.float64), 0.0))
+
+            cj   = np.ascontiguousarray(kdata.astype(np.complex128) * w)
+            grid = _fnufft_type1(xj, yj, zj, cj, ms, mt, mu, isign=-1, eps=args.eps)  # -1
+            img_os = ifft3c(grid.reshape(ms, mt, mu))  # ortho
+            img    = center_crop(img_os, (N, N, N))
 
 
-            img_os = ifft3c(grid.reshape(ms,mt,mu))
-            img = center_crop(img_os, (N,N,N))
         else:
             A, AH = make_ops_finufft(N, args.osf, ktraj, dcf, eps=args.eps)
             img = cg_tikhonov_numpy(A, AH, kdata, lam_l2=args.lambda_l2,
@@ -479,6 +491,23 @@ def main():
     
     # after 'img' is computed (complex)
     np.savez("recon_complex.npz", x=img.astype(np.complex64))
+
+
+    #check once adjoint
+    # check once adjoint
+    x = (np.random.randn(N,N,N) + 1j*np.random.randn(N,N,N)).astype(np.complex128)
+    y = (np.random.randn(ktraj.shape[0]) + 1j*np.random.randn(ktraj.shape[0])).astype(np.complex128)
+    lhs = np.vdot(A(x), y)     # <A x, y>
+    rhs = np.vdot(x, AH(y))    # <x, A^H y>
+    print("adjoint error:", abs(lhs - rhs) / (abs(lhs) + 1e-12))
+
+    x = (np.random.randn(N,N,N) + 1j*np.random.randn(N,N,N)).astype(np.complex128)
+    y = (np.random.randn(ktraj.shape[0]) + 1j*np.random.randn(ktraj.shape[0])).astype(np.complex128)
+    lhs = np.vdot(A(x), y)     # <A x, y>
+    rhs = np.vdot(x, AH(y))    # <x, A^H y>
+    print("adjoint error:", abs(lhs - rhs) / (abs(lhs) + 1e-12))
+
+
 
 
     if args.fov_mm is None:

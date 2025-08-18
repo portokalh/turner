@@ -168,10 +168,12 @@ def make_ops_finufft(N, osf, ktraj, dcf, eps=1e-9):
     ms = mt = mu = N_os
     xj, yj, zj = ktraj_to_radians(ktraj)
     w = np.sqrt(np.maximum(dcf.astype(np.float64), 0.0))
+    
     def A(x):
         Xos = fft3c(center_pad_to(x, (N_os,N_os,N_os))).astype(np.complex128, copy=False)
         fk  = np.ascontiguousarray(Xos)
-        y   = _fnufft_type2(xj, yj, zj, fk, isign=+1, eps=eps)
+        # *** change isign to -1 here ***
+        y   = _fnufft_type2(xj, yj, zj, fk, isign=-1, eps=eps)
         return (w * y).astype(np.complex128)
     def AH(y):
         grid = _fnufft_type1(xj, yj, zj, (w * y).astype(np.complex128),
