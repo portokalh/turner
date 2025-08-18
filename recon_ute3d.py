@@ -476,6 +476,11 @@ def main():
     plt.tight_layout(); plt.savefig(args.png, dpi=300); plt.close()
 
     vox = (float(args.fov_mm)/float(N)) if (args.fov_mm is not None) else 1.0
+    
+    # after 'img' is computed (complex)
+    np.savez("recon_complex.npz", x=img.astype(np.complex64))
+
+
     if args.fov_mm is None:
         print("[warn] FOV not provided; using voxel size 1.0 mm")
     affine = np.diag([vox, vox, vox, 1.0])
