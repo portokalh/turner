@@ -18,9 +18,9 @@ python recon_ute3d.py \
   --fov_mm 20 \
   --png N64_S3300_finufft_cg.png \
   --nii N64_S3300_finufft_cg.nii.gz
+
+  
 Tuning tips
 Slight streaks → raise --lambda_grad (e.g., 1e-3).
-
 Over-smoothing → lower --lambda_grad (e.g., 2e-4).
-
 If SNR is too high/clean (since noise_rel=0), add a touch of noise (e.g., --noise_rel 0.01) to test robustness.
