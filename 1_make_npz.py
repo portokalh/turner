@@ -45,6 +45,19 @@ python 1_make_npz.py --N 96 --spokes 1200 --readout 257 \
 #   --center_out --pair_dirs --kmax 0.5 --use_physical \
 #   --T2star_ms 2.0 --df_Hz 25 --outfile ute3d_phys.npz \
 #   --save_qa --qa_prefix qa_phys
+
+
+
+
+
+final call
+
+# python 1_make_npz.py --N 64 --spokes 3300 --readout 257 \
+>   --center_out --pair_dirs --kmax 0.5 --noise_rel 0.0 \
+>   --recon cg --lambda_l2 1e-4 --lambda_grad 5e-4 --max_iter 15 \
+>   --outfile ute3d_N64_S3300_cg.npz --save_qa --qa_prefix qa_N64_S3300
+
+
 """
 import argparse
 import json
@@ -112,6 +125,51 @@ def compute_dcf_safe(ktraj: np.ndarray, p: float = 2.0, rmin: float = 1e-3):
     dcf = np.power(np.maximum(r, rmin), p)
     m = dcf.mean() if dcf.size > 0 else 1.0
     return (dcf / (m if m > 0 else 1.0)).astype(np.float32)
+
+
+
+
+def make_ops(N, osf, ktraj, dcf):
+    N_os = int(round(osf * N))
+    u = _ktraj_to_ucoords(ktraj, N_os)
+    # keep only samples whose 8-NN touch grid
+    mask = (u[:,0]>=-1)&(u[:,0]<=N_os)&(u[:,1]>=-1)&(u[:,1]<=N_os)&(u[:,2]>=-1)&(u[:,2]<=N_os)
+    u = u[mask]; w = np.sqrt(np.maximum(dcf[mask].astype(np.float64), 0.0))
+
+    def A(x):
+        # x (N,N,N) -> y (M,)
+        Xos = fft3c(center_pad_to(x, (N_os,N_os,N_os)))
+        y  = cic_gather_from_grid(Xos, u)
+        return (w * y).astype(np.complex128)
+
+    def AH(y):
+        # y (M,) -> x (N,N,N)
+        grid = cic_spread_to_grid((w * y).astype(np.complex128), u, N_os, N_os, N_os)
+        xos  = ifft3c(grid)
+        return center_crop(xos, (N,N,N)).astype(np.complex128)
+
+    return A, AH, mask
+
+def cg_tikhonov(A, AH, y, lam_l2=0.0, lam_grad=0.0, N=64, max_iter=15, verbose=True):
+    # Solve (A^H A + lam_l2 I + lam_grad L)x = A^H y via CG
+    b = AH(y)
+    x = np.zeros_like(b)
+    def N_op(v):
+        return AH(A(v)) + lam_l2*v + lam_grad*laplacian3d(v.real).astype(np.complex128)
+    r = b - N_op(x)
+    p = r.copy()
+    rs_old = np.vdot(r, r)
+    for it in range(1, max_iter+1):
+        Ap = N_op(p)
+        alpha = rs_old / (np.vdot(p, Ap) + 1e-30)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rs_new = np.vdot(r, r)
+        if verbose: print(f"[cg] it={it:02d} |r|={np.sqrt(rs_new).real:.3e}")
+        if np.sqrt(rs_new).real < 1e-6: break
+        p = r + (rs_new/rs_old) * p
+        rs_old = rs_new
+    return x
 
 
 # ------------------------------ Simulators ----------------------------- #
@@ -191,6 +249,86 @@ def print_summary(kdata, ktraj, dcf, meta):
 
 
 # ---------- Preview recon (CIC gridding; weight-normalized) ---------- #
+def fft3c(x):
+    return np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(x)))
+
+def ifft3c(X):
+    return np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(X)))
+
+def center_pad_to(x, shape):
+    out = np.zeros(shape, dtype=x.dtype)
+    nx, ny, nz = x.shape
+    Nx, Ny, Nz = shape
+    sx = (Nx - nx)//2; sy = (Ny - ny)//2; sz = (Nz - nz)//2
+    out[sx:sx+nx, sy:sy+ny, sz:sz+nz] = x
+    return out
+
+def center_crop(x, shape):
+    Nx, Ny, Nz = x.shape
+    nx, ny, nz = shape
+    sx = (Nx - nx)//2; sy = (Ny - ny)//2; sz = (Nz - nz)//2
+    return x[sx:sx+nx, sy:sy+ny, sz:sz+nz]
+
+def _ktraj_to_ucoords(ktraj, N_os):
+    # same mapping as preview: cycles/FOV -> grid coords with DC centered
+    return ktraj.astype(np.float64) * N_os + N_os/2.0 - 0.5
+
+def _trilin_indices_weights(u, Nx, Ny, Nz):
+    # u: (M,3) in grid coords; returns 8 neighbor indices + weights
+    ux, uy, uz = u[:,0], u[:,1], u[:,2]
+    i0x = np.floor(ux).astype(np.int64); i1x = np.clip(i0x+1, 0, Nx-1); i0x = np.clip(i0x, 0, Nx-1)
+    i0y = np.floor(uy).astype(np.int64); i1y = np.clip(i0y+1, 0, Ny-1); i0y = np.clip(i0y, 0, Ny-1)
+    i0z = np.floor(uz).astype(np.int64); i1z = np.clip(i0z+1, 0, Nz-1); i0z = np.clip(i0z, 0, Nz-1)
+    wx = ux - np.floor(ux); wy = uy - np.floor(uy); wz = uz - np.floor(uz)
+    w000 = (1-wx)*(1-wy)*(1-wz); w100 = wx*(1-wy)*(1-wz)
+    w010 = (1-wx)*wy*(1-wz);     w110 = wx*wy*(1-wz)
+    w001 = (1-wx)*(1-wy)*wz;     w101 = wx*(1-wy)*wz
+    w011 = (1-wx)*wy*wz;         w111 = wx*wy*wz
+    return (i0x,i1x,i0y,i1y,i0z,i1z,w000,w100,w010,w110,w001,w101,w011,w111)
+
+def cic_spread_to_grid(samples, u, Nx, Ny, Nz):
+    # adjoint: deposit samples to oversampled Cartesian grid (no DCF here)
+    (i0x,i1x,i0y,i1y,i0z,i1z,
+     w000,w100,w010,w110,w001,w101,w011,w111) = _trilin_indices_weights(u,Nx,Ny,Nz)
+
+    grid_r = np.zeros((Nx,Ny,Nz), np.float64)
+    grid_i = np.zeros((Nx,Ny,Nz), np.float64)
+    wgrid  = np.zeros((Nx,Ny,Nz), np.float64)
+
+    s = samples.astype(np.complex128)
+    def _acc(ix,iy,iz, w):
+        np.add.at(grid_r, (ix,iy,iz), (s.real * w))
+        np.add.at(grid_i, (ix,iy,iz), (s.imag * w))
+        np.add.at(wgrid,  (ix,iy,iz), w)
+
+    _acc(i0x,i0y,i0z, w000); _acc(i1x,i0y,i0z, w100)
+    _acc(i0x,i1y,i0z, w010); _acc(i1x,i1y,i0z, w110)
+    _acc(i0x,i0y,i1z, w001); _acc(i1x,i0y,i1z, w101)
+    _acc(i0x,i1y,i1z, w011); _acc(i1x,i1y,i1z, w111)
+
+    grid = (grid_r + 1j*grid_i) / (wgrid + 1e-8)
+    return grid
+
+def cic_gather_from_grid(grid, u):
+    # forward: interpolate grid at nonuniform u
+    Nx, Ny, Nz = grid.shape
+    (i0x,i1x,i0y,i1y,i0z,i1z,
+     w000,w100,w010,w110,w001,w101,w011,w111) = _trilin_indices_weights(u,Nx,Ny,Nz)
+    g = grid
+    vals = (w000*g[i0x,i0y,i0z] + w100*g[i1x,i0y,i0z] +
+            w010*g[i0x,i1y,i0z] + w110*g[i1x,i1y,i0z] +
+            w001*g[i0x,i0y,i1z] + w101*g[i1x,i0y,i1z] +
+            w011*g[i0x,i1y,i1z] + w111*g[i1x,i1y,i1z])
+    return vals
+
+def laplacian3d(x):
+    # 6-neighbor Laplacian (Neumann-ish at edges)
+    xp = np.pad(x, ((1,1),(1,1),(1,1)), mode='edge')
+    return (xp[2:,1:-1,1:-1] + xp[:-2,1:-1,1:-1] +
+            xp[1:-1,2:,1:-1] + xp[1:-1,:-2,1:-1] +
+            xp[1:-1,1:-1,2:] + xp[1:-1,1:-1,:-2] - 6.0*x)
+
+
 
 def preview_recon_cic(kdata, ktraj, dcf, N, osf=2.0, fov_mm=None,
                       png_path="preview_slice.png", nii_path="preview_recon.nii.gz",
@@ -325,6 +463,18 @@ def main():
     p.add_argument("--seed", type=int, default=1234, help="Seed for synthetic generation.")
     # Preview toggle
     p.add_argument("--no_preview", action="store_true", help="Skip PNG/NIfTI preview generation.")
+    
+    
+    p.add_argument("--recon", type=str, default="adjoint",
+               choices=["adjoint", "cg"],
+               help="adjoint (CIC) or CG-Tikhonov recon")
+    p.add_argument("--lambda_l2", type=float, default=0.0,
+               help="L2 (Tikhonov) regularization strength")
+    p.add_argument("--lambda_grad", type=float, default=0.0,
+               help="L2 on gradient (smoothness) strength")
+    p.add_argument("--max_iter", type=int, default=15,
+               help="CG iterations")
+
     args = p.parse_args()
 
     spokes  = int(args.spokes)
@@ -414,6 +564,7 @@ def main():
     print_summary(kdata, ktraj, dcf, meta)
     print(f"\nSaved: {out.resolve()}")
 
+    '''
     # ---- Preview recon (CIC gridding) ----
     if not args.no_preview:
         preview_recon_cic(kdata, ktraj, dcf,
@@ -421,7 +572,43 @@ def main():
                           png_path="preview_slice.png",
                           nii_path="preview_recon.nii.gz",
                           save_qa=args.save_qa, qa_prefix=args.qa_prefix)
-
-
+    '''
+    
+    # ---- Reconstruction / Preview ----
+    if args.recon == "cg":
+        # NUFFT-style CG (Tikhonov / gradient-L2)
+        A, AH, mask = make_ops(args.N, args.os_forward, ktraj, dcf)
+        # Use only the kept samples for y
+        y = kdata[mask]
+        x = cg_tikhonov(A, AH, y,
+                        lam_l2=args.lambda_l2,
+                        lam_grad=args.lambda_grad,
+                        N=args.N, max_iter=args.max_iter)
+        mag = np.abs(x); mag /= (mag.max() + 1e-12)
+    
+        # Save outputs (PNG + NIfTI), reusing your I/O style
+        z = args.N//2
+        plt.figure(figsize=(6,6))
+        plt.imshow(mag[:,:,z].T, cmap="gray", origin="lower")
+        plt.axis("off"); plt.title(f"CG recon (slice {z})")
+        plt.tight_layout(); plt.savefig("preview_slice.png", dpi=300); plt.close()
+        vox = (float(args.fov_mm)/float(args.N)) if (args.fov_mm is not None) else 1.0
+        if args.fov_mm is None: print("[warn] FOV not provided; using voxel size 1.0 mm")
+        affine = np.diag([vox, vox, vox, 1.0])
+        nib.save(nib.Nifti1Image(mag.astype(np.float32), affine), "preview_recon.nii.gz")
+        print("Saved preview_slice.png and preview_recon.nii.gz (CG)")
+    
+    else:
+        # original adjoint preview (CIC)
+        if not args.no_preview:
+            preview_recon_cic(kdata, ktraj, dcf,
+                              N=args.N, osf=args.os_forward, fov_mm=args.fov_mm,
+                              png_path="preview_slice.png",
+                              nii_path="preview_recon.nii.gz",
+                              save_qa=args.save_qa, qa_prefix=args.qa_prefix)
+    
+        
+    
+    
 if __name__ == "__main__":
     main()
